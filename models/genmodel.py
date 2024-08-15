@@ -190,6 +190,29 @@ class BaseGenModel(ABC):
             return self.generate_audio(tokens), tokens
         return self.generate_audio(tokens)
 
+    def generate_continuation_from_tokens(self, prompt_tokens: torch.Tensor,
+                                          descriptions: tp.Optional[tp.List[tp.Optional[str]]] = None,
+                                          progress: bool = False):
+        """Generate samples conditioned on token prompts and an optional text description.
+
+        Args:
+            prompt_tokens (torch.Tensor): A batch of tokens used for continuation.
+                Prompt should be [B, K, T], or [K, T] if only one sample is generated with K the number of codebooks used and T the timestep
+            descriptions (list of str, optional): A list of strings used as text conditioning. Defaults to None.
+            progress (bool, optional): Flag to display progress of the generation process. Defaults to False.
+        """
+        if prompt_tokens.dim() == 2:
+            prompt_tokens = prompt_tokens.view(1, *prompt_tokens.shape)
+        if prompt_tokens.dim() != 3:
+            raise ValueError("prompt should have 3 dimensions: [B, K, T] (K = the number of codebooks used).")
+        if descriptions is None:
+            descriptions = [None] * len(prompt_tokens)
+        attributes, _ = self._prepare_tokens_and_attributes(descriptions, None)
+        assert len(descriptions) == len(prompt_tokens), "Prompt and nb. descriptions doesn't match"
+        assert prompt_tokens is not None
+        tokens = self._generate_tokens(attributes, prompt_tokens, progress)
+        return tokens
+
     def _generate_tokens(self, attributes: tp.List[ConditioningAttributes],
                          prompt_tokens: tp.Optional[torch.Tensor], progress: bool = False) -> torch.Tensor:
         """Generate discrete audio tokens given audio prompt and/or conditions.
