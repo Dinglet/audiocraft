@@ -192,7 +192,8 @@ class BaseGenModel(ABC):
 
     def generate_continuation_from_tokens(self, prompt_tokens: torch.Tensor,
                                           descriptions: tp.Optional[tp.List[tp.Optional[str]]] = None,
-                                          progress: bool = False):
+                                          progress: bool = False) \
+            -> torch.Tensor:
         """Generate samples conditioned on token prompts and an optional text description.
 
         Args:
