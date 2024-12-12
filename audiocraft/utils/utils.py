@@ -141,6 +141,34 @@ def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
     next_token = torch.gather(probs_idx, -1, next_token)
     return next_token
 
+def beam_search(probs: torch.Tensor, beam_width: int) -> torch.Tensor:
+    """Find a number of candidates using beam search.
+
+    Args:
+        probs (torch.Tensor): Input probabilities with token candidates on the last dimension.
+        beam_width (int): The beam width.
+    Returns:
+        torch.Tensor: A beam of sampled tokens.
+    """
+    # Use log probabilities
+    probs = probs.log()
+    B, K, P = probs.shape
+
+    # Initialize beam for the first codebook
+    beam_probs, beam = torch.topk(probs[:, 0], k=beam_width, dim=-1) # [B, beam_width]
+    beam = beam.unsqueeze(-1) # [B, beam_width, 1]
+
+    # Iterate over the rest of the codebooks
+    for k in range(1, K):
+        candidate_probs = beam_probs.unsqueeze(-1) + probs[:, k] # [B, beam_width, P]
+        candidate_probs = candidate_probs.reshape(B, -1) # [B, beam_width * P]
+        beam_probs, indices = torch.topk(candidate_probs, k=beam_width, dim=-1) # [B, beam_width]
+        beam_indices = indices // P # [B, beam_width]
+        token_indices = indices % P # [B, beam_width]
+        beam = torch.gather(beam, dim=1, index=beam_indices.unsqueeze(-1).expand(-1, -1, k)) # [B, beam_width, k]
+        beam = torch.cat((beam, token_indices.unsqueeze(-1)), dim=-1) # [B, beam_width, k+1]
+
+    return beam
 
 class DummyPoolExecutor:
     """Dummy pool executor to use when we actually have only 1 worker.
