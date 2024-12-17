@@ -160,13 +160,15 @@ def beam_search(probs: torch.Tensor, beam_width: int) -> torch.Tensor:
 
     # Iterate over the rest of the codebooks
     for k in range(1, K):
-        candidate_probs = beam_probs.unsqueeze(-1) + probs[:, k]  # [B, beam_width, P]
-        candidate_probs = candidate_probs.reshape(B, -1)  # [B, beam_width * P]
+        # [B, beam_width, 1] x [B, 1, P] -> [B, beam_width, P]
+        candidate_probs = beam_probs[..., None] + probs[:, None, k]
+        candidate_probs = candidate_probs.view(B, beam_width*P)  # [B, beam_width * P]
         beam_probs, indices = torch.topk(candidate_probs, k=beam_width, dim=-1)  # [B, beam_width]
-        beam_indices = indices // P  # [B, beam_width]
-        token_indices = indices % P  # [B, beam_width]
-        beam = beam.take_along_dim(beam_indices.unsqueeze(-1), dim=1)  # [B, beam_width, k]
-        beam = torch.cat((beam, token_indices.unsqueeze(-1)), dim=-1)  # [B, beam_width, k+1]
+        indices = indices.unsqueeze(-1)  # [B, beam_width, 1]
+        beam_indices = indices // P  # [B, beam_width, 1]
+        token_indices = indices % P  # [B, beam_width, 1]
+        beam = beam.take_along_dim(beam_indices, dim=1)  # [B, beam_width, k]
+        beam = torch.cat((beam, token_indices), dim=-1)  # [B, beam_width, k+1]
 
     beam = beam.unsqueeze(-1)  # [B, beam_width, K, 1]
 
