@@ -97,7 +97,8 @@ class MusicGen(BaseGenModel):
                               top_p: float = 0.0, temperature: float = 1.0,
                               duration: float = 30.0, cfg_coef: float = 3.0,
                               cfg_coef_beta: tp.Optional[float] = None,
-                              two_step_cfg: bool = False, extend_stride: float = 18,):
+                              two_step_cfg: bool = False, extend_stride: float = 18,
+                               beam_width: int = 0,):
         """Set the generation parameters for MusicGen.
 
         Args:
@@ -117,6 +118,7 @@ class MusicGen(BaseGenModel):
             extend_stride: when doing extended generation (i.e. more than 30 seconds), by how much
                 should we extend the audio each time. Larger values will mean less context is
                 preserved, and shorter value will require extra computations.
+            beam_width (int, optional): Beam width used for beam search. Defaults to 0.
         """
         assert extend_stride < self.max_duration, "Cannot stride by more than max generation duration."
         self.extend_stride = extend_stride
@@ -130,6 +132,8 @@ class MusicGen(BaseGenModel):
             'two_step_cfg': two_step_cfg,
             'cfg_coef_beta': cfg_coef_beta,
         }
+        if beam_width > 0:
+            self.generation_params['beam_width'] = beam_width
 
     def set_style_conditioner_params(self, eval_q: int = 3, excerpt_length: float = 3.0,
                                      ds_factor: tp.Optional[int] = None,
@@ -283,9 +287,14 @@ class MusicGen(BaseGenModel):
         if self.duration <= self.max_duration:
             # generate by sampling from LM, simple case.
             with self.autocast:
-                gen_tokens = self.lm.generate(
-                    prompt_tokens, attributes,
-                    callback=callback, max_gen_len=total_gen_len, **self.generation_params)
+                if self.generation_params['beam_width'] > 0:
+                    gen_tokens = self.lm.generate_with_beam_search(
+                        prompt_tokens, attributes,
+                        callback=callback, max_gen_len=total_gen_len, **self.generation_params)
+                else:
+                    gen_tokens = self.lm.generate(
+                        prompt_tokens, attributes,
+                        callback=callback, max_gen_len=total_gen_len, **self.generation_params)
 
         else:
             # now this gets a bit messier, we need to handle prompts,
