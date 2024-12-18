@@ -287,7 +287,7 @@ class MusicGen(BaseGenModel):
         if self.duration <= self.max_duration:
             # generate by sampling from LM, simple case.
             with self.autocast:
-                if self.generation_params['beam_width'] > 0:
+                if self.generation_params.get('beam_width', 0):
                     gen_tokens = self.lm.generate_with_beam_search(
                         prompt_tokens, attributes,
                         callback=callback, max_gen_len=total_gen_len, **self.generation_params)
