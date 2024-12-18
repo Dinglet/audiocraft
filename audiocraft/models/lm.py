@@ -776,7 +776,7 @@ class LMModel(StreamingModule):
                 if callback is not None:
                     callback(1 + offset - start_offset_sequence, gen_sequence_len - start_offset_sequence)
             # take the best sequence from the beam
-            gen_sequence = beam[:, torch.argmax(beam_log_probs, dim=1), :, :].view(B, K, -1)
+            gen_sequence = beam[torch.arange(B), torch.argmax(beam_log_probs, dim=1)]
 
         unconditional_state.clear()
 
