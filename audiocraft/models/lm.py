@@ -727,7 +727,7 @@ class LMModel(StreamingModule):
             beam = gen_sequence.unsqueeze(1)
             beam_log_probs = torch.zeros(B, 1, device=device)  # log probability of each sequence in the beam
             for offset in range(start_offset_sequence, gen_sequence_len):
-                new_beam = torch.empty((B, 0, K, gen_sequence_len), device=device)
+                new_beam = torch.empty((B, 0, K, gen_sequence_len), device=device, dtype=beam.dtype)
                 new_log_probs = torch.empty((B, 0), device=device)
                 # for each sequence in the beam, we sample the next token
                 for w in range(beam.shape[1]):
