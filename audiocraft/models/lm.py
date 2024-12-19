@@ -723,12 +723,16 @@ class LMModel(StreamingModule):
             unconditional_state = self.get_streaming_state()
             prev_offset = 0
             gen_sequence_len = gen_sequence.shape[-1]  # gen_sequence shape is [B, K, S]
+
             # initialize the beam to [B, 1, K, S]
             beam = gen_sequence.unsqueeze(1)
             beam_log_probs = torch.zeros(B, 1, device=device)  # log probability of each sequence in the beam
+            beam_states = [self.get_streaming_state()]
+
             for offset in range(start_offset_sequence, gen_sequence_len):
                 new_beam = torch.empty((B, 0, K, gen_sequence_len), device=device, dtype=beam.dtype)
                 new_log_probs = torch.empty((B, 0), device=device)
+                new_beam_states = []
                 # for each sequence in the beam, we sample the next token
                 for w in range(beam.shape[1]):
                     # get current sequence (note that the streaming API is providing the caching over previous offsets)
@@ -739,11 +743,13 @@ class LMModel(StreamingModule):
                         assert (curr_sequence == torch.where(curr_mask, curr_sequence, self.special_token_id)).all()
                         # should never happen as gen_sequence is filled progressively
                         assert not (curr_sequence == unknown_token).any()
+                    self.set_streaming_state(beam_states[w])
                     # sample next token from the model, next token shape is [B, beam_width, K, 1]
                     next_token, prob = self._sample_next_token(
                         curr_sequence, cfg_conditions, unconditional_state, use_sampling, temp, top_k, top_p,
                         cfg_coef=cfg_coef, cfg_coef_beta=cfg_coef_beta, two_step_cfg=two_step_cfg,
                         beam_width=beam_width, return_prob=True)
+                    new_beam_states.append(self.get_streaming_state())
                     # [B, K, 1] -> [B, 1, K, 1]
                     if next_token.dim() == 3:
                         next_token = next_token.unsqueeze(1)
@@ -769,8 +775,12 @@ class LMModel(StreamingModule):
                     # trim
                     new_log_probs, indices = new_log_probs.topk(k=beam_width, dim=1)
                     new_beam = new_beam.take_along_dim(indices=indices[..., None, None], dim=1)
+                    new_beam_states = ...  # impractical to keep track of the states for each beam
+                    # the indices (w*) to the best sequence in the beam may be different for each batch,
+                    # and it is impractical to keep track of the state of each sequence in the beam after _sample_next_token
                 beam = new_beam
                 beam_log_probs = new_log_probs
+                beam_states = new_beam_states
 
                 prev_offset = offset
                 if callback is not None:
