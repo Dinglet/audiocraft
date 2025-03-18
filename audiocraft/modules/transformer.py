@@ -690,7 +690,7 @@ class StreamingTransformer(StreamingModule):
         else:
             raise ValueError(f"Checkpointing method {method} is unknown.")
 
-    def forward(self, x: torch.Tensor, *args, **kwargs):
+    def forward(self, x: torch.Tensor, output_hidden_states: bool = False, *args, **kwargs):
         B, T, C = x.shape
 
         if 'offsets' in self._streaming_state:
@@ -704,11 +704,21 @@ class StreamingTransformer(StreamingModule):
             pos_emb = create_sin_embedding(positions, C, max_period=self.max_period, dtype=x.dtype)
             x = x + self.positional_scale * pos_emb
 
+        all_hidden_states = () if output_hidden_states else None
+
         for layer in self.layers:
+            if output_hidden_states:
+                all_hidden_states = all_hidden_states + (x,)
             x = self._apply_layer(layer, x, *args, **kwargs)
+
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (x,)
 
         if self._is_streaming:
             self._streaming_state['offsets'] = offsets + T
+
+        if output_hidden_states:
+            return x, all_hidden_states
 
         return x
 
