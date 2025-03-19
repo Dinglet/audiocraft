@@ -704,6 +704,10 @@ class StreamingTransformer(StreamingModule):
             pos_emb = create_sin_embedding(positions, C, max_period=self.max_period, dtype=x.dtype)
             x = x + self.positional_scale * pos_emb
 
+        # Below we get all hidden states.
+        #
+        # References:
+        # - huggingface/transformers/src/transformers/models/wav2vec2/modeling_wav2vec2.py
         all_hidden_states = () if output_hidden_states else None
 
         for layer in self.layers:
