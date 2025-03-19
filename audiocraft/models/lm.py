@@ -260,7 +260,6 @@ class LMModel(StreamingModule):
             assert not conditions, "Shouldn't pass both conditions and condition_tensors."
 
         input_, cross_attention_input = self.fuser(input_, condition_tensors)
-        assert cross_attention_input is not None, "Cross attention input should be provided."
 
         out = self.transformer(
             input_,
