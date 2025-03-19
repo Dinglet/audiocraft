@@ -265,3 +265,52 @@ class BaseGenModel(ABC):
         with torch.no_grad():
             gen_audio = self.compression_model.decode(gen_tokens, None)
         return gen_audio
+
+    def extract_features(self, prompt: torch.Tensor, prompt_sample_rate: int,
+                         descriptions: tp.Optional[tp.List[tp.Optional[str]]] = None,
+                         progress: bool = False) \
+            -> tp.Tuple:
+        """Modified from self.generate_continuation"""
+        if prompt.dim() == 2:
+            prompt = prompt[None]
+        if prompt.dim() != 3:
+            raise ValueError("prompt should have 3 dimensions: [B, C, T] (C = 1).")
+        prompt = convert_audio(prompt, prompt_sample_rate, self.sample_rate, self.audio_channels)
+        if descriptions is None:
+            descriptions = [None] * len(prompt)
+        attributes, prompt_tokens = self._prepare_tokens_and_attributes(descriptions, prompt)
+        assert prompt_tokens is not None
+        features = self._extract_features_from_tokens(attributes, prompt_tokens, progress)
+        return features
+
+    def _extract_features_from_tokens(self, attributes: tp.List[ConditioningAttributes],
+                          prompt_tokens: tp.Optional[torch.Tensor], progress: bool = False) -> torch.Tensor:
+        """Extract hidden layer outputs given audio prompt and/or conditions.
+        """
+        total_gen_len = int(self.duration * self.frame_rate)
+        max_prompt_len = int(min(self.duration, self.max_duration) * self.frame_rate)
+        current_gen_offset: int = 0
+
+        def _progress_callback(generated_tokens: int, tokens_to_generate: int):
+            generated_tokens += current_gen_offset
+            if self._progress_callback is not None:
+                # Note that total_gen_len might be quite wrong depending on the
+                # codebook pattern used, but with delay it is almost accurate.
+                self._progress_callback(generated_tokens, tokens_to_generate)
+            else:
+                print(f'{generated_tokens: 6d} / {tokens_to_generate: 6d}', end='\r')
+
+        if prompt_tokens is not None:
+            assert max_prompt_len >= prompt_tokens.shape[-1], \
+                "Prompt is longer than audio to generate"
+
+        callback = None
+        if progress:
+            callback = _progress_callback
+
+        # generate by sampling from LM, simple case.
+        with self.autocast:
+            features = self.lm.extract_features(
+                prompt_tokens, conditions=attributes,
+                callback=callback, max_gen_len=total_gen_len, **self.generation_params)
+        return features
