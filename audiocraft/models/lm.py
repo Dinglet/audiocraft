@@ -607,39 +607,23 @@ class LMModel(StreamingModule):
 
     @torch.no_grad()
     def extract_features(self,
-                 prompt: tp.Optional[torch.Tensor] = None,
-                 conditions: tp.List[ConditioningAttributes] = [],
-                 num_samples: tp.Optional[int] = None,
-                 max_gen_len: int = 256,
-                 use_sampling: bool = True,
-                 temp: float = 1.0,
-                 top_k: int = 250,
-                 top_p: float = 0.0,
-                 cfg_coef: tp.Optional[float] = None,
-                 cfg_coef_beta: tp.Optional[float] = None,
-                 two_step_cfg: tp.Optional[bool] = None,
-                 remove_prompts: bool = False,
-                 check: bool = False,
-                 callback: tp.Optional[tp.Callable[[int, int], None]] = None,
-                 ) -> torch.Tensor:
+                         prompt: torch.Tensor,
+                         conditions: tp.List[ConditioningAttributes] = [],
+                         max_gen_len: int = 256,
+                         use_sampling: bool = True,
+                         temp: float = 1.0,
+                         top_k: int = 250,
+                         top_p: float = 0.0,
+                         cfg_coef: tp.Optional[float] = None,
+                         cfg_coef_beta: tp.Optional[float] = None,
+                         two_step_cfg: tp.Optional[bool] = None,
+                         remove_prompts: bool = False,
+                         ) -> torch.Tensor:
         """Modified from `generate` to extract features instead of generating tokens.
         """
         assert not self.training, "feature extraction shouldn't be used in training mode."
         first_param = next(iter(self.parameters()))
         device = first_param.device
-
-        # Checking all input shapes are consistent.
-        possible_num_samples = []
-        if num_samples is not None:
-            possible_num_samples.append(num_samples)
-        elif prompt is not None:
-            possible_num_samples.append(prompt.shape[0])
-        elif conditions:
-            possible_num_samples.append(len(conditions))
-        else:
-            possible_num_samples.append(1)
-        assert [x == possible_num_samples[0] for x in possible_num_samples], "Inconsistent inputs shapes"
-        num_samples = possible_num_samples[0]
 
         # below we create set of conditions: only unconditional
         cfg_conditions: CFGConditions
@@ -649,10 +633,6 @@ class LMModel(StreamingModule):
         cfg_conditions = self.condition_provider(tokenized)
 
         two_step_cfg = self.two_step_cfg if two_step_cfg is None else two_step_cfg
-
-        if prompt is None:
-            assert num_samples > 0
-            prompt = torch.zeros((num_samples, self.num_codebooks, 0), dtype=torch.long, device=device)
 
         B, K, T = prompt.shape
         start_offset = 0
@@ -674,39 +654,15 @@ class LMModel(StreamingModule):
         start_offset_sequence = pattern.get_first_step_with_timesteps(start_offset)
         assert start_offset_sequence is not None
 
-        all_features = torch.empty(
-            (
-                B,
-                len(self.transformer.layers) + 1,
-                gen_sequence_len - start_offset_sequence,
-                self.dim,
-            ),
-            device=device,
-        )
-
         with self.streaming():
             unconditional_state = self.get_streaming_state()
-            prev_offset = 0
-            for offset in range(start_offset_sequence, gen_sequence_len):
-                # get current sequence (note that the streaming API is providing the caching over previous offsets)
-                curr_sequence = gen_sequence[..., prev_offset:offset]
-                curr_mask = mask[None, ..., prev_offset:offset].expand(B, -1, -1)
-                if check:
-                    # check coherence between mask and sequence
-                    assert (curr_sequence == torch.where(curr_mask, curr_sequence, self.special_token_id)).all()
-                    # # should never happen as gen_sequence is filled progressively
-                    # assert not (curr_sequence == unknown_token).any()
-                # sample next token from the model, next token shape is [B, K, 1]
-                features: tp.Tuple = self._extract_token_features(
-                    curr_sequence, cfg_conditions, unconditional_state, use_sampling, temp, top_k, top_p,
-                    cfg_coef=cfg_coef, cfg_coef_beta=cfg_coef_beta, two_step_cfg=two_step_cfg)
-                all_features[:, :, prev_offset:offset, :] = torch.stack(features, dim=1)
-                prev_offset = offset
-                if callback is not None:
-                    callback(1 + offset - start_offset_sequence, gen_sequence_len - start_offset_sequence)
+            curr_sequence = gen_sequence
+            features: tp.Tuple = self._extract_token_features(
+                curr_sequence, cfg_conditions, unconditional_state, use_sampling, temp, top_k, top_p,
+                cfg_coef=cfg_coef, cfg_coef_beta=cfg_coef_beta, two_step_cfg=two_step_cfg)
         unconditional_state.clear()
 
-        return all_features
+        return features
 
         # ensure sequence has been entirely filled
         assert not (gen_sequence == unknown_token).any()
@@ -745,11 +701,11 @@ class LMModel(StreamingModule):
         cfg_coef = self.cfg_coef if cfg_coef is None else cfg_coef
         model = self if self._fsdp is None else self._fsdp
 
-        null_condition_tensors = cfg_conditions
+        condition_tensors = cfg_conditions
 
-        all_logits, features = model(
+        logits, features = model(
             sequence, output_hidden_states=True,
-            conditions=[], condition_tensors=null_condition_tensors)
+            conditions=[], condition_tensors=condition_tensors)
 
         return features
 
