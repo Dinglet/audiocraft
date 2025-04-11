@@ -117,6 +117,13 @@ class LMOutput:
     mask: torch.Tensor  # [B, K, T]
 
 
+@dataclass
+class LMFeatures:
+    logits: tp.Optional[torch.Tensor] = None  # [B, K, T, card]
+    hidden_states : tp.Optional[tp.Tuple[torch.Tensor, ...]] = None  # ([B, T, dim], ...)
+    sequence_logits: tp.Optional[torch.Tensor] = None  # [B, K, T, ...]
+
+
 class LMModel(StreamingModule):
     """Transformer-based language model on multiple streams of codes.
 
@@ -225,7 +232,7 @@ class LMModel(StreamingModule):
         condition_tensors: tp.Optional[ConditionTensors] = None,
         stage: int = -1,
         output_hidden_states: bool = False,
-    ) -> tp.Union[torch.Tensor, tp.Tuple[torch.Tensor, tp.Any]]:
+    ) -> tp.Union[torch.Tensor, tp.Tuple[torch.Tensor, tp.Tuple[torch.Tensor, ...]]]:
         """Apply language model on sequence and conditions.
         Given a tensor of sequence of shape [B, K, S] with K the number of codebooks and
         S the sequence steps, return the logits with shape [B, card, K, S].
@@ -606,19 +613,20 @@ class LMModel(StreamingModule):
         return out_codes
 
     @torch.no_grad()
-    def extract_features(self,
-                         prompt: torch.Tensor,
-                         conditions: tp.List[ConditioningAttributes] = [],
-                         max_gen_len: int = 256,
-                         use_sampling: bool = True,
-                         temp: float = 1.0,
-                         top_k: int = 250,
-                         top_p: float = 0.0,
-                         cfg_coef: tp.Optional[float] = None,
-                         cfg_coef_beta: tp.Optional[float] = None,
-                         two_step_cfg: tp.Optional[bool] = None,
-                         remove_prompts: bool = False,
-                         ) -> torch.Tensor:
+    def extract_features(
+        self,
+        prompt: torch.Tensor,
+        conditions: tp.List[ConditioningAttributes] = [],
+        max_gen_len: int = 256,
+        use_sampling: bool = True,
+        temp: float = 1.0,
+        top_k: int = 250,
+        top_p: float = 0.0,
+        cfg_coef: tp.Optional[float] = None,
+        cfg_coef_beta: tp.Optional[float] = None,
+        two_step_cfg: tp.Optional[bool] = None,
+        remove_prompts: bool = False,
+    ) -> LMFeatures:
         """Modified from `generate` to extract features instead of generating tokens.
         """
         assert not self.training, "feature extraction shouldn't be used in training mode."
@@ -657,45 +665,58 @@ class LMModel(StreamingModule):
         with self.streaming():
             unconditional_state = self.get_streaming_state()
             curr_sequence = gen_sequence
-            features: tp.Tuple = self._extract_token_features(
+            features: LMFeatures = self._extract_token_features(
                 curr_sequence, cfg_conditions, unconditional_state, use_sampling, temp, top_k, top_p,
                 cfg_coef=cfg_coef, cfg_coef_beta=cfg_coef_beta, two_step_cfg=two_step_cfg)
         unconditional_state.clear()
 
+        logits = features.logits
+
+        # curr_sequence shape is [B, K, S]
+        # logits shape is [B, K, S, card]
+        # sequence_logits shape is [B, K, S, 1]
+
+        # look up the values in logits according to the actual tokens in the sequence
+        sequence_logits = torch.empty(
+            [*logits.shape[:-1], 1], dtype=logits.dtype, device=logits.device
+        )
+        # skip special token id in the front
+        valid_sequence = curr_sequence[..., 1:]
+        valid_index = valid_sequence.clamp(0, self.card - 1).unsqueeze(-1)
+        sequence_logits[:, :, :-1, 0] = logits.gather(-1, valid_index).squeeze(-1)
+
+        logits_mask = ((valid_sequence >= 0) & (valid_sequence < self.card)).unsqueeze(-1)
+        sequence_logits[:, :, :logits_mask.shape[-2]].masked_fill_(~logits_mask, torch.nan)
+
+        # logits shape is [B, K, S, card]
+        logits = logits.permute(0, 3, 1, 2)  # [B, card, K, S]
+        logits, *_ = pattern.revert_pattern_logits(logits, torch.nan)  # [B, card, K, T]
+        logits = logits.permute(0, 2, 3, 1)  # [B, K, T, card]
+
+        # sequence_logits shape is [B, K, S, 1]
+        sequence_logits = sequence_logits.permute(0, 3, 1, 2)  # [B, 1, K, S]
+        sequence_logits, *_ = pattern.revert_pattern_logits(
+            sequence_logits, torch.nan
+        )  # [B, 1, K, T]
+        sequence_logits = sequence_logits.permute(0, 2, 3, 1)  # [B, K, T, 1]
+
+        features.logits = logits
+        features.sequence_logits = sequence_logits
         return features
 
-        # ensure sequence has been entirely filled
-        assert not (gen_sequence == unknown_token).any()
-        # ensure gen_sequence pattern and mask are matching
-        # which means the gen_sequence is valid according to the pattern
-        assert (
-            gen_sequence == torch.where(mask[None, ...].expand(B, -1, -1), gen_sequence, self.special_token_id)
-        ).all()
-        # get back the codes, trimming the prompt if needed and cutting potentially incomplete timesteps
-        out_codes, out_indexes, out_mask = pattern.revert_pattern_sequence(gen_sequence, special_token=unknown_token)
-
-        # sanity checks over the returned codes and corresponding masks
-        assert (out_codes[..., :max_gen_len] != unknown_token).all()
-        assert (out_mask[..., :max_gen_len] == 1).all()
-
-        out_start_offset = start_offset if remove_prompts else 0
-        out_codes = out_codes[..., out_start_offset:max_gen_len]
-
-        # ensure the returned codes are all valid
-        assert (out_codes >= 0).all() and (out_codes <= self.card).all()
-        return out_codes
-
-    def _extract_token_features(self,
-                           sequence: torch.Tensor,
-                           cfg_conditions: CFGConditions,
-                           unconditional_state: State,
-                           use_sampling: bool = False,
-                           temp: float = 1.0,
-                           top_k: int = 0,
-                           top_p: float = 0.0,
-                           cfg_coef: tp.Optional[float] = None,
-                           cfg_coef_beta: tp.Optional[float] = None,
-                           two_step_cfg: tp.Optional[bool] = None) -> torch.Tensor:
+    def _extract_token_features(
+        self,
+        sequence: torch.Tensor,
+        cfg_conditions: CFGConditions,
+        unconditional_state: State,
+        use_sampling: bool = False,
+        temp: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 0.0,
+        cfg_coef: tp.Optional[float] = None,
+        cfg_coef_beta: tp.Optional[float] = None,
+        two_step_cfg: tp.Optional[bool] = None,
+    ) -> LMFeatures:
         """Modified from _sample_next_token."""
         B = sequence.shape[0]
         cfg_coef = self.cfg_coef if cfg_coef is None else cfg_coef
@@ -703,25 +724,11 @@ class LMModel(StreamingModule):
 
         condition_tensors = cfg_conditions
 
-        logits, features = model(
+        logits, hidden_states = model(
             sequence, output_hidden_states=True,
             conditions=[], condition_tensors=condition_tensors)
 
-        return features
-
-        logits = logits.permute(0, 1, 3, 2)  # [B, K, card, T]
-        logits = logits[..., -1]  # [B x K x card]
-
-        # Apply softmax for sampling if temp > 0. Else, do greedy sampling to avoid zero division error.
-        if use_sampling and temp > 0.0:
-            probs = torch.softmax(logits / temp, dim=-1)
-            if top_p > 0.0:
-                next_token = utils.sample_top_p(probs, p=top_p)
-            elif top_k > 0:
-                next_token = utils.sample_top_k(probs, k=top_k)
-            else:
-                next_token = utils.multinomial(probs, num_samples=1)
-        else:
-            next_token = torch.argmax(logits, dim=-1, keepdim=True)
-
-        return next_token
+        return LMFeatures(
+            logits=logits,
+            hidden_states=hidden_states,
+        )

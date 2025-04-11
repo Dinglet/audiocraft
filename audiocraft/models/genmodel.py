@@ -19,6 +19,7 @@ import torch
 
 from .encodec import CompressionModel
 from .lm import LMModel
+from .lm import LMFeatures
 from .builders import get_wrapped_compression_model
 from ..data.audio_utils import convert_audio
 from ..modules.conditioners import ConditioningAttributes
@@ -267,7 +268,7 @@ class BaseGenModel(ABC):
         return gen_audio
 
     def extract_features(self, prompt: torch.Tensor, prompt_sample_rate: int,
-                         descriptions: tp.Optional[tp.List[tp.Optional[str]]] = None) -> tp.Tuple:
+                         descriptions: tp.Optional[tp.List[tp.Optional[str]]] = None) -> LMFeatures:
         """Modified from self.generate_continuation"""
         if prompt.dim() == 2:
             prompt = prompt[None]
@@ -281,20 +282,46 @@ class BaseGenModel(ABC):
         features = self._extract_features_from_tokens(attributes, prompt_tokens)
         return features
 
-    def _extract_features_from_tokens(self, attributes: tp.List[ConditioningAttributes],
-                          prompt_tokens: tp.Optional[torch.Tensor]) -> torch.Tensor:
-        """Extract hidden layer outputs given audio prompt and/or conditions.
-        """
+    def extract_features_from_tokens(
+        self,
+        tokens: torch.Tensor,
+        descriptions: tp.Optional[tp.List[tp.Optional[str]]] = None,
+    ) -> LMFeatures:
+        if tokens.dim() == 2:
+            tokens = tokens[None]
+        if tokens.dim() != 3:
+            raise ValueError(
+                "prompt should have 3 dimensions: [B, K, T] (K = the number of codebooks used)."
+            )
+        if descriptions is None:
+            descriptions = [None] * len(tokens)
+
+        attributes, _ = self._prepare_tokens_and_attributes(descriptions, None)
+        features = self._extract_features_from_tokens(attributes, tokens)
+        return features
+
+    def _extract_features_from_tokens(
+        self,
+        attributes: tp.List[ConditioningAttributes],
+        tokens: tp.Optional[torch.Tensor],
+        start_offset: int = 0,
+        n_steps: tp.Optional[int] = None,
+    ) -> LMFeatures:
+        """Extract hidden layer outputs given audio prompt and/or conditions."""
         total_gen_len = int(self.duration * self.frame_rate)
         max_prompt_len = int(min(self.duration, self.max_duration) * self.frame_rate)
 
-        if prompt_tokens is not None:
-            assert max_prompt_len >= prompt_tokens.shape[-1], \
-                "Prompt is longer than audio to generate"
+        if tokens is not None:
+            assert (
+                max_prompt_len >= tokens.shape[-1]
+            ), "Prompt is longer than audio to generate"
 
         # generate by sampling from LM, simple case.
         with self.autocast:
             features = self.lm.extract_features(
-                prompt_tokens, conditions=attributes,
-                max_gen_len=total_gen_len, **self.generation_params)
+                tokens,
+                conditions=attributes,
+                max_gen_len=total_gen_len,
+                **self.generation_params,
+            )
         return features
