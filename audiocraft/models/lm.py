@@ -121,8 +121,8 @@ class LMOutput:
 class LMFeatures:
     logits: tp.Optional[torch.Tensor] = None  # [B, K, T, card]
     hidden_states : tp.Optional[tp.Tuple[torch.Tensor, ...]] = None  # ([B, T, dim], ...)
-    max_logits: tp.Optional[torch.Tensor] = None  # [B, K, T, ...]
-    sequence_logits: tp.Optional[torch.Tensor] = None  # [B, K, T, ...]
+    max_logits: tp.Optional[torch.Tensor] = None  # [B, K, T]
+    sequence_logits: tp.Optional[torch.Tensor] = None  # [B, K, T]
 
 
 class LMModel(StreamingModule):
@@ -671,42 +671,18 @@ class LMModel(StreamingModule):
                 cfg_coef=cfg_coef, cfg_coef_beta=cfg_coef_beta, two_step_cfg=two_step_cfg)
         unconditional_state.clear()
 
-        logits = features.logits
-
-        # curr_sequence shape is [B, K, S]
-        # logits shape is [B, K, S, card]
-        # sequence_logits shape is [B, K, S, 1]
-
-        max_logits: torch.Tensor = logits.max(dim=-1, keepdim=True).values
-
-        # look up the values in logits according to the actual tokens in the sequence
-        sequence_logits = torch.empty(
-            [*logits.shape[:-1], 1], dtype=logits.dtype, device=logits.device
-        )
-        # skip special token id in the front
-        valid_sequence = curr_sequence[..., 1:]
-        valid_index = valid_sequence.clamp(0, self.card - 1).unsqueeze(-1)
-        sequence_logits[:, :, :-1, 0] = logits.gather(-1, valid_index).squeeze(-1)
-
-        logits_mask = ((valid_sequence >= 0) & (valid_sequence < self.card)).unsqueeze(-1)
-        sequence_logits[:, :, :logits_mask.shape[-2]].masked_fill_(~logits_mask, torch.nan)
-
-        # logits shape is [B, K, S, card]
+        logits = features.logits  # [B, K, S, card]
         logits = logits.permute(0, 3, 1, 2)  # [B, card, K, S]
         logits, *_ = pattern.revert_pattern_logits(logits, torch.nan)  # [B, card, K, T]
         logits = logits.permute(0, 2, 3, 1)  # [B, K, T, card]
 
-        # max_logits shape is [B, K, S, 1]
-        max_logits = max_logits.permute(0, 3, 1, 2)  # [B, 1, K, S]
-        max_logits, *_ = pattern.revert_pattern_logits(max_logits, torch.nan)
-        max_logits = max_logits.permute(0, 2, 3, 1)  # [B, K, T, 1]
+        max_logits: torch.Tensor = logits.max(dim=-1).values
 
-        # sequence_logits shape is [B, K, S, 1]
-        sequence_logits = sequence_logits.permute(0, 3, 1, 2)  # [B, 1, K, S]
-        sequence_logits, *_ = pattern.revert_pattern_logits(
-            sequence_logits, torch.nan
-        )  # [B, 1, K, T]
-        sequence_logits = sequence_logits.permute(0, 2, 3, 1)  # [B, K, T, 1]
+        # look up the values in logits according to the actual tokens in the sequence
+        sequence_logits = torch.empty(
+            logits.shape[:-1], dtype=logits.dtype, device=logits.device
+        )
+        sequence_logits = logits.gather(-1, prompt.unsqueeze(-1)).squeeze(-1)
 
         features.logits = logits
         features.max_logits = max_logits
