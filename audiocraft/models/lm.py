@@ -121,6 +121,7 @@ class LMOutput:
 class LMFeatures:
     logits: tp.Optional[torch.Tensor] = None  # [B, K, T, card]
     hidden_states : tp.Optional[tp.Tuple[torch.Tensor, ...]] = None  # ([B, T, dim], ...)
+    max_logits: tp.Optional[torch.Tensor] = None  # [B, K, T, ...]
     sequence_logits: tp.Optional[torch.Tensor] = None  # [B, K, T, ...]
 
 
@@ -676,6 +677,8 @@ class LMModel(StreamingModule):
         # logits shape is [B, K, S, card]
         # sequence_logits shape is [B, K, S, 1]
 
+        max_logits: torch.Tensor = logits.max(dim=-1, keepdim=True).values
+
         # look up the values in logits according to the actual tokens in the sequence
         sequence_logits = torch.empty(
             [*logits.shape[:-1], 1], dtype=logits.dtype, device=logits.device
@@ -693,6 +696,11 @@ class LMModel(StreamingModule):
         logits, *_ = pattern.revert_pattern_logits(logits, torch.nan)  # [B, card, K, T]
         logits = logits.permute(0, 2, 3, 1)  # [B, K, T, card]
 
+        # max_logits shape is [B, K, S, 1]
+        max_logits = max_logits.permute(0, 3, 1, 2)  # [B, 1, K, S]
+        max_logits, *_ = pattern.revert_pattern_logits(max_logits, torch.nan)
+        max_logits = max_logits.permute(0, 2, 3, 1)  # [B, K, T, 1]
+
         # sequence_logits shape is [B, K, S, 1]
         sequence_logits = sequence_logits.permute(0, 3, 1, 2)  # [B, 1, K, S]
         sequence_logits, *_ = pattern.revert_pattern_logits(
@@ -701,6 +709,7 @@ class LMModel(StreamingModule):
         sequence_logits = sequence_logits.permute(0, 2, 3, 1)  # [B, K, T, 1]
 
         features.logits = logits
+        features.max_logits = max_logits
         features.sequence_logits = sequence_logits
         return features
 
