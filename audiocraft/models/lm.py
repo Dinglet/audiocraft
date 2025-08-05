@@ -117,6 +117,14 @@ class LMOutput:
     mask: torch.Tensor  # [B, K, T]
 
 
+@dataclass
+class LMFeatures:
+    logits: tp.Optional[torch.Tensor] = None  # [B, K, T, card]
+    hidden_states : tp.Optional[tp.Tuple[torch.Tensor, ...]] = None  # ([B, T, dim], ...)
+    max_logits: tp.Optional[torch.Tensor] = None  # [B, K, T]
+    sequence_logits: tp.Optional[torch.Tensor] = None  # [B, K, T]
+
+
 class LMModel(StreamingModule):
     """Transformer-based language model on multiple streams of codes.
 
@@ -218,10 +226,14 @@ class LMModel(StreamingModule):
     def num_codebooks(self) -> int:
         return self.n_q
 
-    def forward(self, sequence: torch.Tensor,
-                conditions: tp.List[ConditioningAttributes],
-                condition_tensors: tp.Optional[ConditionTensors] = None,
-                stage: int = -1) -> torch.Tensor:
+    def forward(
+        self,
+        sequence: torch.Tensor,
+        conditions: tp.List[ConditioningAttributes],
+        condition_tensors: tp.Optional[ConditionTensors] = None,
+        stage: int = -1,
+        output_hidden_states: bool = False,
+    ) -> tp.Union[torch.Tensor, tp.Tuple[torch.Tensor, tp.Tuple[torch.Tensor, ...]]]:
         """Apply language model on sequence and conditions.
         Given a tensor of sequence of shape [B, K, S] with K the number of codebooks and
         S the sequence steps, return the logits with shape [B, card, K, S].
@@ -236,8 +248,10 @@ class LMModel(StreamingModule):
             stage (int): The codebook level that is being predicted. Relevant for MAGNeT
                 in which prediction is done in a codebook-by-codebook manner.
                 Takes values in range(n_q), and ignored by default.
+            output_hidden_states (bool): Whether or not to return the hidden states of all layers.
         Returns:
             torch.Tensor: Logits.
+            tuple: Hidden states if `output_hidden_states` is True.
         """
         B, K, S = sequence.shape
         assert K == self.num_codebooks, "Sequence shape must match the specified number of codebooks"
@@ -255,8 +269,18 @@ class LMModel(StreamingModule):
 
         input_, cross_attention_input = self.fuser(input_, condition_tensors)
 
-        out = self.transformer(input_, cross_attention_src=cross_attention_input,
-                               src_mask=(self.attn_mask_per_stage[stage] if stage >= 0 else None))  # type: ignore
+        out = self.transformer(
+            input_,
+            output_hidden_states=output_hidden_states,
+            cross_attention_src=cross_attention_input,
+            src_mask=(self.attn_mask_per_stage[stage] if stage >= 0 else None),
+        )  # type: ignore
+
+        if output_hidden_states:
+            out, hidden_states = out
+        else:
+            hidden_states = None
+
         if self.out_norm:
             out = self.out_norm(out)
         logits = torch.stack([self.linears[k](out) for k in range(K)], dim=1)  # [B, K, S, card]
@@ -264,6 +288,9 @@ class LMModel(StreamingModule):
         # remove the prefix from the model outputs
         if len(self.fuser.fuse2cond['prepend']) > 0:
             logits = logits[:, :, -S:]
+
+        if output_hidden_states:
+            return logits, hidden_states
 
         return logits  # [B, K, S, card]
 
@@ -585,3 +612,108 @@ class LMModel(StreamingModule):
         # ensure the returned codes are all valid
         assert (out_codes >= 0).all() and (out_codes <= self.card).all()
         return out_codes
+
+    @torch.no_grad()
+    def extract_features(
+        self,
+        prompt: torch.Tensor,
+        conditions: tp.List[ConditioningAttributes] = [],
+        max_gen_len: int = 256,
+        use_sampling: bool = True,
+        temp: float = 1.0,
+        top_k: int = 250,
+        top_p: float = 0.0,
+        cfg_coef: tp.Optional[float] = None,
+        cfg_coef_beta: tp.Optional[float] = None,
+        two_step_cfg: tp.Optional[bool] = None,
+        remove_prompts: bool = False,
+    ) -> LMFeatures:
+        """Modified from `generate` to extract features instead of generating tokens.
+        """
+        assert not self.training, "feature extraction shouldn't be used in training mode."
+        first_param = next(iter(self.parameters()))
+        device = first_param.device
+
+        # below we create set of conditions: only unconditional
+        cfg_conditions: CFGConditions
+        cfg_conditions = {}
+        null_conditions = ClassifierFreeGuidanceDropout(p=1.0)(conditions)
+        tokenized = self.condition_provider.tokenize(null_conditions)
+        cfg_conditions = self.condition_provider(tokenized)
+
+        two_step_cfg = self.two_step_cfg if two_step_cfg is None else two_step_cfg
+
+        B, K, T = prompt.shape
+        start_offset = 0
+        assert start_offset < max_gen_len
+
+        pattern = self.pattern_provider.get_pattern(T)
+        # this token is used as default value for codes that are not generated yet
+        unknown_token = -1
+
+        # we generate codes up to the max_gen_len that will be mapped to the pattern sequence
+        gen_codes = torch.full((B, K, T), unknown_token, dtype=torch.long, device=device)
+        # filling the gen_codes with the prompt if needed
+        gen_codes[..., :T] = prompt
+        # create the gen_sequence with proper interleaving from the pattern: [B, K, S]
+        gen_sequence, indexes, mask = pattern.build_pattern_sequence(gen_codes, self.special_token_id)
+        gen_sequence_len = gen_sequence.shape[-1]  # gen_sequence shape is [B, K, S]
+        # retrieve the start_offset in the sequence:
+        # it is the first sequence step that contains the `start_offset` timestep
+        start_offset_sequence = pattern.get_first_step_with_timesteps(start_offset)
+        assert start_offset_sequence is not None
+
+        with self.streaming():
+            unconditional_state = self.get_streaming_state()
+            curr_sequence = gen_sequence
+            features: LMFeatures = self._extract_token_features(
+                curr_sequence, cfg_conditions, unconditional_state, use_sampling, temp, top_k, top_p,
+                cfg_coef=cfg_coef, cfg_coef_beta=cfg_coef_beta, two_step_cfg=two_step_cfg)
+        unconditional_state.clear()
+
+        logits = features.logits  # [B, K, S, card]
+        logits = logits.permute(0, 3, 1, 2)  # [B, card, K, S]
+        logits, *_ = pattern.revert_pattern_logits(logits, torch.nan)  # [B, card, K, T]
+        logits = logits.permute(0, 2, 3, 1)  # [B, K, T, card]
+
+        max_logits: torch.Tensor = logits.max(dim=-1).values
+
+        # look up the values in logits according to the actual tokens in the sequence
+        sequence_logits = torch.empty(
+            logits.shape[:-1], dtype=logits.dtype, device=logits.device
+        )
+        sequence_logits = logits.gather(-1, prompt.unsqueeze(-1)).squeeze(-1)
+
+        features.logits = logits
+        features.max_logits = max_logits
+        features.sequence_logits = sequence_logits
+        return features
+
+    def _extract_token_features(
+        self,
+        sequence: torch.Tensor,
+        cfg_conditions: CFGConditions,
+        unconditional_state: State,
+        use_sampling: bool = False,
+        temp: float = 1.0,
+        top_k: int = 0,
+        top_p: float = 0.0,
+        cfg_coef: tp.Optional[float] = None,
+        cfg_coef_beta: tp.Optional[float] = None,
+        two_step_cfg: tp.Optional[bool] = None,
+    ) -> LMFeatures:
+        """Modified from _sample_next_token."""
+        B = sequence.shape[0]
+        cfg_coef = self.cfg_coef if cfg_coef is None else cfg_coef
+        model = self if self._fsdp is None else self._fsdp
+
+        condition_tensors = cfg_conditions
+
+        logits, hidden_states = model(
+            sequence, output_hidden_states=True,
+            conditions=[], condition_tensors=condition_tensors)
+
+        return LMFeatures(
+            logits=logits,
+            hidden_states=hidden_states,
+        )
